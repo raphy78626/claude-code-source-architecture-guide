@@ -1,30 +1,74 @@
-# Claude Code Architecture Learning Path
+# Claude Code Architecture -- Learning Path
 
-This is a fundamentals-first architecture guide for `claude-code-source`.
-
-If you are new, read in this order:
-
-1. `CLAUDE_CODE_ARCHITECTURE_EASY.md` (big picture)
-2. `01-startup-bootstrap-deep-dive.md`
-3. `02-query-lifecycle-deep-dive.md`
-4. `03-tools-permissions-mcp-deep-dive.md`
+> A fundamentals-first guide to understanding the [claude-code-source](https://github.com/AprilNEA/claude-code-source) codebase.
+> Written for anyone -- beginner or experienced -- who wants to quickly understand how Claude Code works under the hood.
 
 ---
 
-## Visual map (overview)
+## How to read this guide
 
-![Claude Code architecture overview](./claude-code-architecture.png)
+Start with the overview, then dive into whichever component interests you.
+
+| # | Page | What you will learn |
+|---|------|---------------------|
+| 0 | [Architecture Overview](./CLAUDE_CODE_ARCHITECTURE_EASY.md) | The big picture: all 6 layers, end-to-end flow, slash commands, and key files |
+| 1 | [Startup & Bootstrap Deep Dive](./01-startup-bootstrap-deep-dive.md) | How `claude` starts fast, then safely loads the full runtime |
+| 2 | [Query Lifecycle Deep Dive](./02-query-lifecycle-deep-dive.md) | How one prompt becomes a streaming response, including tool loops |
+| 3 | [Tools, Permissions & MCP Deep Dive](./03-tools-permissions-mcp-deep-dive.md) | How tools are found, approved, executed, and how MCP extends them |
 
 ---
 
-## What each child page teaches
+## Visual overview
 
-- `01-startup-bootstrap-deep-dive.md`: how `claude` starts fast, then loads full runtime safely.
-- `02-query-lifecycle-deep-dive.md`: how one prompt becomes streaming output, including tool loops.
-- `03-tools-permissions-mcp-deep-dive.md`: how tools are selected, approved, executed, and integrated with MCP.
+This diagram shows the end-to-end flow from user input to assistant response.
+Open it in [Excalidraw](https://excalidraw.com) using the [source file](./claude-code-architecture.excalidraw) for interactive editing.
 
-Each child page includes:
-- easy explanations,
-- practical mental models,
-- one deeper component PNG,
-- key files to read in source.
+<p align="center">
+  <img src="./claude-code-architecture.png" alt="Claude Code architecture overview diagram" width="100%" />
+</p>
+
+---
+
+## Quick glossary
+
+| Term | Meaning |
+|------|---------|
+| **REPL** | Read-Eval-Print Loop -- the interactive terminal UI powered by [Ink](https://github.com/vadimdemedes/ink) |
+| **query loop** | The core agent cycle in `query.ts`: send messages to API, get response, run tools if needed, repeat |
+| **tool_use / tool_result** | Anthropic API protocol: model asks to use a tool (`tool_use`), runtime returns the output (`tool_result`) |
+| **MCP** | Model Context Protocol -- an open standard for connecting AI models to external tools and data sources |
+| **bootstrap/state** | A singleton module holding session-wide runtime state (session ID, settings, flags) |
+| **slash command** | User commands like `/help`, `/compact`, `/config` that are processed locally before the model sees them |
+
+---
+
+## Repository structure (key paths)
+
+```
+src/
+├── entrypoints/cli.tsx    # Thin CLI bootstrap (fast path)
+├── main.tsx               # Full orchestrator (args, init, mode selection)
+├── entrypoints/init.ts    # Global initialization (config, env, telemetry)
+├── bootstrap/state.ts     # Process-wide session state
+├── replLauncher.tsx       # Mounts Ink REPL UI
+├── screens/REPL.tsx       # Interactive REPL surface
+├── query.ts               # Core agent loop (stream + tool execution)
+├── services/
+│   ├── api/claude.ts      # Model API streaming
+│   ├── mcp/client.ts      # MCP server connections
+│   └── tools/
+│       ├── toolExecution.ts     # Individual tool runner
+│       └── toolOrchestration.ts # Parallel/batch tool coordination
+├── tools.ts               # Tool catalog (getAllBaseTools)
+├── commands.ts            # Slash command registry
+└── utils/
+    ├── permissions/permissions.ts  # Allow / ask / deny engine
+    ├── processUserInput/           # Input parsing pipeline
+    └── slashCommandParsing.ts      # /command parser
+```
+
+---
+
+## Next step
+
+Start reading: **[Architecture Overview](./CLAUDE_CODE_ARCHITECTURE_EASY.md)**

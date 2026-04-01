@@ -1,261 +1,293 @@
-# Claude Code Source Architecture (Easy Guide)
+# Claude Code Architecture Overview
 
-This guide explains how this codebase works in simple terms.
+> **[Back to Learning Path](./README.md)** | **Next:** [Startup & Bootstrap Deep Dive](./01-startup-bootstrap-deep-dive.md)
 
-For deeper component pages with embedded PNG diagrams:
-- `README.md`
-- `01-startup-bootstrap-deep-dive.md`
-- `02-query-lifecycle-deep-dive.md`
-- `03-tools-permissions-mcp-deep-dive.md`
-
-![Architecture overview PNG](./claude-code-architecture.png)
-
-The short version:
-- `claude` starts in a lightweight CLI bootstrap.
-- The app initializes config, auth, state, and integrations.
-- It launches either an interactive REPL UI (Ink) or a non-interactive print mode.
-- User input is parsed (normal prompt or slash command), then sent through the query loop.
-- The model may request tools; tools are permission-checked, executed, and results are fed back.
-- The loop continues until the assistant reaches a final response.
+This page gives you the complete big picture of how Claude Code works -- in simple terms.
+By the end, you will understand every layer from typing `claude` to seeing a response.
 
 ---
 
-## 1) Big Picture
+## Table of contents
 
-Think of the system as 6 layers:
+- [The 30-second summary](#the-30-second-summary)
+- [The 6 layers](#the-6-layers)
+- [End-to-end flow diagram](#end-to-end-flow-diagram)
+- [Startup fundamentals](#startup-fundamentals)
+- [Input to output lifecycle](#input-to-output-lifecycle)
+- [Slash commands](#slash-commands)
+- [Tools, permissions, and safety](#tools-permissions-and-safety)
+- [MCP integration](#mcp-integration)
+- [State and observability](#state-and-observability)
+- [One prompt walkthrough](#one-prompt-walkthrough-in-plain-words)
+- [Top 12 files to read first](#top-12-files-to-read-first)
 
-1. **Entrypoint layer**: starts fast and routes to the right runtime path.
-2. **Bootstrap layer**: loads settings, policies, telemetry, auth, and environment.
-3. **Interaction layer**: REPL UI and input handling.
-4. **Agent loop layer**: message/query loop with streaming model responses.
-5. **Tool layer**: built-in tools, MCP tools, permission gating, execution.
-6. **State + observability layer**: session state, transcripts, analytics, telemetry.
+---
+
+## The 30-second summary
+
+<p align="center">
+  <img src="./claude-code-architecture.png" alt="Claude Code architecture overview" width="100%" />
+</p>
+
+1. You run `claude` in your terminal.
+2. A thin bootstrap checks for fast-path flags, then loads the full app.
+3. The app initializes config, auth, state, and integrations.
+4. It launches either an **interactive REPL** (terminal UI) or a **headless print** mode.
+5. Your input is parsed -- normal prompt or slash command -- then sent through the **query loop**.
+6. The model streams a response. If it needs a tool, the **permission engine** decides, the **tool executor** runs it, and results feed back into the loop.
+7. This continues until the model produces a final answer.
+
+---
+
+## The 6 layers
+
+Think of Claude Code as 6 stacked layers. Each layer has a clear job:
+
+| # | Layer | What it does | Key files |
+|---|-------|-------------|-----------|
+| 1 | **Entrypoint** | Starts fast, routes to the right runtime path | [`src/entrypoints/cli.tsx`](../../src/entrypoints/cli.tsx) |
+| 2 | **Bootstrap** | Loads settings, policies, telemetry, auth, environment | [`src/main.tsx`](../../src/main.tsx), [`src/entrypoints/init.ts`](../../src/entrypoints/init.ts) |
+| 3 | **Interaction** | REPL terminal UI and input handling | [`src/screens/REPL.tsx`](../../src/screens/REPL.tsx) |
+| 4 | **Agent loop** | Message/query loop with streaming model responses | [`src/query.ts`](../../src/query.ts) |
+| 5 | **Tools** | Built-in tools, MCP tools, permission gating, execution | [`src/tools.ts`](../../src/tools.ts), [`src/services/tools/`](../../src/services/tools/) |
+| 6 | **State + Observability** | Session state, transcripts, analytics, telemetry | [`src/bootstrap/state.ts`](../../src/bootstrap/state.ts) |
+
+---
+
+## End-to-end flow diagram
 
 ```mermaid
 flowchart TD
-    A["User runs `claude`"] --> B["CLI bootstrap<br/>src/entrypoints/cli.tsx"]
-    B --> C["Main orchestration<br/>src/main.tsx"]
-    C --> D["Init + bootstrap state<br/>src/entrypoints/init.ts + src/bootstrap/state.ts"]
-    D --> E{"Mode?"}
-    E -->|Interactive| F["Ink REPL UI<br/>src/replLauncher.tsx + src/screens/REPL.tsx"]
-    E -->|Non-interactive / print| G["Headless print path<br/>src/cli/print.ts"]
-    F --> H["Query loop<br/>src/query.ts"]
+    A["User runs claude"] --> B["CLI bootstrap\nsrc/entrypoints/cli.tsx"]
+    B --> C["Main orchestration\nsrc/main.tsx"]
+    C --> D["Init + bootstrap state\nsrc/entrypoints/init.ts"]
+    D --> E{"Interactive\nor headless?"}
+    E -->|Interactive| F["Ink REPL UI\nsrc/screens/REPL.tsx"]
+    E -->|Headless / SDK| G["Print path\nsrc/cli/print.ts"]
+    F --> H["Query loop\nsrc/query.ts"]
     G --> H
-    H --> I["Claude API streaming<br/>src/services/api/claude.ts"]
-    I --> J{"Tool requested?"}
-    J -->|Yes| K["Permissions + tool execution<br/>src/utils/permissions/permissions.ts + src/services/tools/toolExecution.ts"]
+    H --> I["Claude API streaming\nsrc/services/api/claude.ts"]
+    I --> J{"Tool\nrequested?"}
+    J -->|Yes| K["Permissions + execution\npermissions.ts + toolExecution.ts"]
     K --> H
     J -->|No| L["Final assistant response"]
 ```
 
 ---
 
-## 2) Startup Fundamentals
+## Startup fundamentals
 
-### Step A: Fast bootstrap
+> **Deep dive:** [Startup & Bootstrap Deep Dive](./01-startup-bootstrap-deep-dive.md)
 
-`src/entrypoints/cli.tsx` is intentionally small and fast:
-- handles quick paths like `--version`,
-- handles feature-gated special modes,
-- then imports and hands off to `main()`.
+Startup is split into two phases so cheap commands (like `claude --version`) don't pay the full cost of loading everything.
 
-This design avoids loading the full app for cheap commands.
+### Phase 1 -- Fast gate
 
-### Step B: Main orchestration
+[`src/entrypoints/cli.tsx`](../../src/entrypoints/cli.tsx) runs first. It handles:
+- `--version` (prints version, exits immediately),
+- feature-gated fast paths (bridge, daemon, background sessions),
+- then lazily imports `main.tsx`.
 
-`src/main.tsx` is the orchestrator:
-- parses CLI options and determines interactive vs non-interactive mode,
-- initializes environment and services (`init`),
-- sets process/session-level state in `bootstrap/state.ts`,
-- loads tools, commands, MCP resources, plugins, and skills,
-- launches REPL (interactive) or print/headless flow.
+### Phase 2 -- Full runtime
 
-### Step C: Global init and trust-sensitive setup
+[`src/main.tsx`](../../src/main.tsx) is the orchestrator:
+- parses CLI options,
+- runs [`init()`](../../src/entrypoints/init.ts) for environment setup,
+- sets session state in [`bootstrap/state.ts`](../../src/bootstrap/state.ts),
+- loads tools, commands, MCP servers, plugins, and skills,
+- launches either REPL or headless path.
 
-`src/entrypoints/init.ts` performs global setup (config, safe env, cleanup, telemetry plumbing).
-
-In simple terms: **startup is split into "fast route" and "full setup"** so the app can be both responsive and feature-rich.
+**Why it matters:** this two-phase design means `claude --version` takes ~50ms, while a full interactive session gets all features loaded in parallel.
 
 ---
 
-## 3) Input to Output Lifecycle
+## Input to output lifecycle
 
-This is the core "how Claude Code works" loop.
+> **Deep dive:** [Query Lifecycle Deep Dive](./02-query-lifecycle-deep-dive.md)
+
+This is the core "how Claude Code works" loop:
 
 ```mermaid
 sequenceDiagram
     participant U as User
-    participant REPL as REPL/UI
+    participant REPL as REPL / UI
     participant Input as Input Processor
     participant Q as Query Loop
     participant API as Claude API
     participant PERM as Permission Engine
     participant TOOL as Tool Executor
 
-    U->>REPL: Type prompt or /slash command
-    REPL->>Input: processUserInput(...)
-    Input->>Q: Normalized messages + context
-    Q->>API: queryModel(...) stream request
-    API-->>Q: Assistant deltas (text/thinking/tool_use)
-    alt Model requested tool_use
-        Q->>PERM: canUseTool(...) decision
-        PERM-->>Q: allow/ask/deny
-        Q->>TOOL: runToolUse/runTools
-        TOOL-->>Q: tool_result blocks
-        Q->>API: Continue turn with tool results
+    U->>REPL: Type prompt or /command
+    REPL->>Input: processUserInput()
+    Input->>Q: Normalized messages
+    Q->>API: queryModel() stream
+    API-->>Q: text / thinking / tool_use
+    alt tool_use block present
+        Q->>PERM: canUseTool()
+        PERM-->>Q: allow / ask / deny
+        Q->>TOOL: runToolUse()
+        TOOL-->>Q: tool_result
+        Q->>API: Continue with results
     end
-    API-->>Q: Final assistant response
+    API-->>Q: Final response
     Q-->>REPL: Render output
 ```
 
-Key files in this path:
-- UI entry: `src/replLauncher.tsx`, `src/screens/REPL.tsx`
-- Input handling: `src/utils/processUserInput/processUserInput.ts`, `src/utils/processUserInput/processSlashCommand.tsx`
-- Command parsing: `src/utils/slashCommandParsing.ts`
-- Core loop: `src/query.ts`
-- API call path: `src/services/api/claude.ts`
+**Key files in this path:**
+
+| Stage | File |
+|-------|------|
+| UI entry | [`src/replLauncher.tsx`](../../src/replLauncher.tsx), [`src/screens/REPL.tsx`](../../src/screens/REPL.tsx) |
+| Input parsing | [`src/utils/processUserInput/processUserInput.ts`](../../src/utils/processUserInput/processUserInput.ts) |
+| Slash command parsing | [`src/utils/slashCommandParsing.ts`](../../src/utils/slashCommandParsing.ts) |
+| Core loop | [`src/query.ts`](../../src/query.ts) |
+| API streaming | [`src/services/api/claude.ts`](../../src/services/api/claude.ts) |
 
 ---
 
-## 4) Slash Commands (Simple Mental Model)
+## Slash commands
 
-Slash commands are not magic. They follow a clean pipeline:
-
-1. detect `/...` input,
-2. parse command name + args (`parseSlashCommand`),
-3. resolve command from registry (`commands.ts`),
-4. dispatch by command type:
-   - local,
-   - local-jsx,
-   - prompt/fork.
+Slash commands are not magic. They follow a clean 3-step pipeline:
 
 ```mermaid
 flowchart LR
-    A["Input starts with /"] --> B["parseSlashCommand()<br/>src/utils/slashCommandParsing.ts"]
-    B --> C["Command lookup<br/>src/commands.ts"]
+    A["Input starts\nwith /"] --> B["parseSlashCommand()\nslashCommandParsing.ts"]
+    B --> C["Command lookup\ncommands.ts"]
     C --> D{"Command type"}
     D -->|local| E["Run local command"]
-    D -->|local-jsx| F["Run local JSX command"]
-    D -->|prompt| G["Generate prompt/forked flow"]
-    E --> H["Messages/Result"]
-    F --> H
-    G --> H
+    D -->|local-jsx| F["Render JSX UI"]
+    D -->|prompt| G["Expand to model prompt"]
 ```
+
+1. **Parse** -- [`parseSlashCommand()`](../../src/utils/slashCommandParsing.ts) extracts name + args.
+2. **Lookup** -- [`commands.ts`](../../src/commands.ts) resolves the name against the merged command registry (built-in + plugins + skills).
+3. **Dispatch** -- depending on the command type:
+   - **`local`**: runs synchronously, returns text (e.g. `/clear`)
+   - **`local-jsx`**: renders an Ink UI component (e.g. `/config`)
+   - **`prompt`**: generates context for the model, optionally in a forked sub-agent (e.g. `/review`)
 
 ---
 
-## 5) Tools, Permissions, and Safety
+## Tools, permissions, and safety
 
-### Tool registration
+> **Deep dive:** [Tools, Permissions & MCP Deep Dive](./03-tools-permissions-mcp-deep-dive.md)
 
-`src/tools.ts` defines the tool catalog (`getAllBaseTools()`):
-- file tools (`ReadFile`, `FileEdit`, `Glob`, etc.),
-- shell tools (`Bash`, `PowerShell`),
-- web tools (`WebFetch`, `WebSearch`),
-- planning/task tools,
-- MCP resource/tools bridge,
-- many feature-gated tools.
+### Tool catalog
 
-### Permission decisions
+[`src/tools.ts`](../../src/tools.ts) defines the full tool inventory via `getAllBaseTools()`:
 
-Before a tool runs, permission logic evaluates:
-- allow rules,
-- deny rules,
-- ask rules,
-- mode/classifier/hook constraints.
+| Category | Examples |
+|----------|----------|
+| File tools | `FileRead`, `FileEdit`, `FileWrite`, `Glob`, `Grep` |
+| Shell tools | `Bash`, `PowerShell` |
+| Web tools | `WebFetch`, `WebSearch` |
+| Planning tools | `TodoWrite`, `EnterPlanMode`, `ExitPlanMode` |
+| Agent tools | `AgentTool` (sub-agents), `SkillTool` |
+| MCP bridge | `MCPTool`, `ListMcpResources`, `ReadMcpResource` |
+| Task tools | `TaskCreate`, `TaskUpdate`, `TaskList`, `TaskStop` |
 
-This logic lives in `src/utils/permissions/permissions.ts`.
-
-### Execution
-
-If approved, execution flows through `src/services/tools/toolExecution.ts` (with hooks and telemetry), and orchestration helpers under `src/services/tools/toolOrchestration.ts`.
+### Permission flow
 
 ```mermaid
 flowchart TD
     A["Model emits tool_use"] --> B["Find tool by name"]
-    B --> C["Permission evaluation<br/>allow / ask / deny"]
-    C -->|deny| D["Return tool_result error"]
-    C -->|ask| E["Prompt user / approval path"]
-    E --> F{"Approved?"}
+    B --> C["Permission evaluation"]
+    C -->|deny| D["Return error to model"]
+    C -->|ask| E["Prompt user for approval"]
+    E --> F{"User approved?"}
     F -->|No| D
-    F -->|Yes| G["Execute tool call"]
+    F -->|Yes| G["Execute tool"]
     C -->|allow| G
     G --> H["Post-hooks + telemetry"]
-    H --> I["tool_result returned to query loop"]
+    H --> I["tool_result back to query loop"]
 ```
 
----
-
-## 6) MCP Integration (Model Context Protocol)
-
-`src/services/mcp/client.ts` manages MCP servers and connections:
-- transport types (stdio/SSE/streamable HTTP/websocket),
-- listing MCP tools/resources,
-- MCP tool call execution + error handling,
-- auth flows (including MCP auth tool),
-- resource reads and result handling.
-
-Beginner mental model:
-- MCP lets Claude Code treat external systems as tools/resources.
-- The MCP client converts remote capabilities into local "tool-like" interfaces.
+Permission rules come from multiple sources -- CLI args, user settings, project settings, policy settings, and session grants -- all evaluated in [`permissions.ts`](../../src/utils/permissions/permissions.ts).
 
 ---
 
-## 7) State and Observability Fundamentals
+## MCP integration
 
-### State
-- `src/bootstrap/state.ts`: process/session-wide runtime state.
-- `src/state/*`: app/repl state store and transitions.
-- `src/utils/sessionStorage.ts`: transcript/session persistence helpers.
+[MCP (Model Context Protocol)](https://modelcontextprotocol.io/) lets Claude Code talk to external servers as if they were local tools.
+
+[`src/services/mcp/client.ts`](../../src/services/mcp/client.ts) handles:
+- connecting via stdio, SSE, streamable HTTP, or WebSocket transports,
+- discovering tools and resources from each server,
+- executing tool calls with auth, timeout, and error handling,
+- resource reads and binary content persistence.
+
+**Simple mental model:** MCP turns remote APIs into tool-shaped interfaces that the model can call just like built-in tools.
+
+---
+
+## State and observability
+
+### State management
+
+| What | Where |
+|------|-------|
+| Process-wide session state | [`src/bootstrap/state.ts`](../../src/bootstrap/state.ts) |
+| REPL UI state | [`src/state/AppStateStore.ts`](../../src/state/AppStateStore.ts), [`src/state/store.ts`](../../src/state/store.ts) |
+| Session persistence | [`src/utils/sessionStorage.ts`](../../src/utils/sessionStorage.ts) |
 
 ### Observability
-- `src/services/analytics/index.ts`: product analytics events.
-- `src/utils/telemetry/*`: tracing and telemetry internals.
 
-Practical meaning: the app can recover context, track behavior, and debug performance over long sessions.
-
----
-
-## 8) "One Prompt" Walkthrough (In Plain Words)
-
-When you type one request:
-1. UI receives text.
-2. Parser checks if it is slash command or normal message.
-3. Query loop sends structured messages to the model API.
-4. Model streams output.
-5. If model needs tools, permission engine decides and tool executor runs approved tools.
-6. Tool results are added back to the conversation.
-7. Model continues and returns final answer.
-8. REPL renders final response and stores session artifacts.
+| What | Where |
+|------|-------|
+| Product analytics | [`src/services/analytics/index.ts`](../../src/services/analytics/index.ts) |
+| OTel-style tracing | [`src/utils/telemetry/sessionTracing.ts`](../../src/utils/telemetry/sessionTracing.ts) |
+| Perfetto traces | [`src/utils/telemetry/perfettoTracing.ts`](../../src/utils/telemetry/perfettoTracing.ts) |
 
 ---
 
-## 9) Most Important Files to Read First
+## One prompt walkthrough (in plain words)
+
+When you type one request, here is exactly what happens:
+
+1. **REPL** receives your text.
+2. **Input processor** checks: is this a `/slash command` or a normal message?
+3. **Query loop** packages messages + system prompt + tool schemas and sends to the API.
+4. **API** streams back: text chunks, thinking blocks, and/or `tool_use` blocks.
+5. If `tool_use`: **permission engine** evaluates rules, **tool executor** runs the approved tool, result is added to conversation.
+6. **Loop repeats** (steps 3-5) until no more tool calls.
+7. **Final response** is rendered in the REPL.
+8. **Session storage** persists transcript artifacts.
+
+---
+
+## Top 12 files to read first
 
 If you want to learn this codebase quickly, read in this order:
 
-1. `src/entrypoints/cli.tsx`
-2. `src/main.tsx`
-3. `src/entrypoints/init.ts`
-4. `src/replLauncher.tsx`
-5. `src/screens/REPL.tsx`
-6. `src/query.ts`
-7. `src/services/api/claude.ts`
-8. `src/tools.ts`
-9. `src/services/tools/toolExecution.ts`
-10. `src/utils/permissions/permissions.ts`
-11. `src/services/mcp/client.ts`
-12. `src/commands.ts`
+| # | File | Why |
+|---|------|-----|
+| 1 | [`src/entrypoints/cli.tsx`](../../src/entrypoints/cli.tsx) | Entry point -- fast path routing |
+| 2 | [`src/main.tsx`](../../src/main.tsx) | Full orchestrator -- args, init, mode |
+| 3 | [`src/entrypoints/init.ts`](../../src/entrypoints/init.ts) | Environment and service setup |
+| 4 | [`src/replLauncher.tsx`](../../src/replLauncher.tsx) | How Ink REPL gets mounted |
+| 5 | [`src/screens/REPL.tsx`](../../src/screens/REPL.tsx) | Interactive surface and query dispatch |
+| 6 | [`src/query.ts`](../../src/query.ts) | The agent loop -- streaming + tool execution |
+| 7 | [`src/services/api/claude.ts`](../../src/services/api/claude.ts) | Model API call implementation |
+| 8 | [`src/tools.ts`](../../src/tools.ts) | Tool catalog registration |
+| 9 | [`src/services/tools/toolExecution.ts`](../../src/services/tools/toolExecution.ts) | Individual tool runner |
+| 10 | [`src/utils/permissions/permissions.ts`](../../src/utils/permissions/permissions.ts) | Permission allow/ask/deny engine |
+| 11 | [`src/services/mcp/client.ts`](../../src/services/mcp/client.ts) | MCP server integration |
+| 12 | [`src/commands.ts`](../../src/commands.ts) | Slash command registry |
 
 ---
 
-## 10) Why This Architecture Works
+## Why this architecture works
 
-In simple terms, this architecture separates concerns clearly:
-- startup is optimized for speed,
-- UI loop is independent from model API details,
-- tool system is modular and permission-gated,
-- external integrations (MCP/plugins/skills) are pluggable,
-- state and telemetry are centralized.
+This design separates concerns cleanly:
 
-That separation makes a very complex agent system maintainable in practice.
+- **Startup is fast** -- cheap commands exit in milliseconds.
+- **UI is decoupled from model logic** -- REPL and headless share the same query loop.
+- **Tools are modular and gated** -- each tool has a schema, permission rules, and execution hooks.
+- **External integrations are pluggable** -- MCP, plugins, and skills all load through the same interfaces.
+- **State and telemetry are centralized** -- one place to debug, recover, or analyze sessions.
+
+That separation is what makes a 1900-file agent system maintainable.
+
+---
+
+**Next:** [Startup & Bootstrap Deep Dive](./01-startup-bootstrap-deep-dive.md)
