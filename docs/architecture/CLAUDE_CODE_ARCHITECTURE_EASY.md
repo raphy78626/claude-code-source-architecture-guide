@@ -2,6 +2,14 @@
 
 This guide explains how this codebase works in simple terms.
 
+For deeper component pages with embedded PNG diagrams:
+- `README.md`
+- `01-startup-bootstrap-deep-dive.md`
+- `02-query-lifecycle-deep-dive.md`
+- `03-tools-permissions-mcp-deep-dive.md`
+
+![Architecture overview PNG](./claude-code-architecture.png)
+
 The short version:
 - `claude` starts in a lightweight CLI bootstrap.
 - The app initializes config, auth, state, and integrations.
